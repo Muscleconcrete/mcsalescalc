@@ -275,14 +275,47 @@ const DATA = {
 };
 
 const els = Object.fromEntries([...document.querySelectorAll('input,select,textarea')].map(el => [el.id, el]));
-let zipContext = { taxRate: 0, taxState: '', travelCost: 0, travelHours: 0, warehouse: '', miles: 0, ok: false, taxSource: 'none' };
+let zipContext = { taxRate: 0, taxState: '', travelCost: 0, travelHours: 0, warehouse: '', miles: 0, ok: false, taxSource: 'none', travelSource: 'none' };
 const zipCache = new Map();
 let zipLookupTimer = null;
 let zipLookupSeq = 0;
 
+const BUILT_IN_COMBINED_TAX_FALLBACK = {
+  AL: 0.0950, AR: 0.0945, AZ: 0.0840, CA: 0.0850, CO: 0.0775, FL: 0.0702, GA: 0.0737,
+  IA: 0.0682, ID: 0.0620, IL: 0.0886, IN: 0.0700, KS: 0.0868, KY: 0.0600, LA: 0.0955,
+  MA: 0.0625, MD: 0.0600, ME: 0.0550, MI: 0.0600, MN: 0.0749, MO: 0.0829, MS: 0.0707,
+  NC: 0.0688, ND: 0.0685, NE: 0.0694, NJ: 0.0663, NM: 0.0783, NV: 0.0824, NY: 0.0852,
+  OH: 0.0724, OK: 0.0897, PA: 0.0634, RI: 0.0700, SC: 0.0743, SD: 0.0640, TN: 0.0947,
+  TX: 0.0820, UT: 0.0725, VA: 0.0577, WA: 0.0929, WI: 0.0544, WV: 0.0640, WY: 0.0539,
+  DC: 0.0600
+};
+
 function money(n) { return new Intl.NumberFormat('en-US', { style:'currency', currency:'USD', maximumFractionDigits:2 }).format(n || 0); }
 function ceilTo(n, step) { return Math.ceil((n || 0) / step) * step; }
+function round2(n) { return Math.round(((n || 0) + Number.EPSILON) * 100) / 100; }
 function clamp(val, min, max) { return Math.max(min, Math.min(max, val)); }
+function haversineMiles(lat1, lon1, lat2, lon2) {
+  const toRad = deg => deg * Math.PI / 180;
+  const R = 3958.7613;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+function estimateDriveHoursFromMiles(miles) {
+  return miles <= 0 ? 0 : Math.max(miles / 52, miles / 60 + 0.35);
+}
+function getTravelCostFromHours(hours) {
+  if (hours <= 2) return 0;
+  if (hours <= 4) return 300;
+  if (hours <= 8) return 975;
+  if (hours <= 12) return 1350;
+  if (hours <= 16) return 1750;
+  return 2400;
+}
+function getBuiltInCombinedFallbackRate(stateAbbr) {
+  return BUILT_IN_COMBINED_TAX_FALLBACK[String(stateAbbr || '').toUpperCase()] ?? DATA.stateTax[String(stateAbbr || '').toUpperCase()] ?? 0;
+}
 function bounds(val, allowed) {
   const arr = allowed.map(Number).sort((a,b)=>a-b);
   if (val <= arr[0]) return { low: arr[0], high: arr[0] };
@@ -484,6 +517,11 @@ async function fetchCombinedTaxRate(zip, city, fallbackStateAbbr) {
     };
   }
 
+  const builtInCombinedRate = getBuiltInCombinedFallbackRate(fallbackStateAbbr);
+  if (Number.isFinite(builtInCombinedRate) && builtInCombinedRate > 0) {
+    return { rate: builtInCombinedRate, source: 'built_in_combined_fallback', compared: `built_in_combined_fallback:${pct(builtInCombinedRate)}` };
+  }
+
   return { rate: fallbackRate, source: 'state_fallback', compared: `state_fallback:${pct(fallbackRate)}` };
 }
 
@@ -500,7 +538,7 @@ async function fetchZipData(zip) {
   const requestId = ++zipLookupSeq;
 
   if (!/^\d{5}$/.test(zip)) {
-    zipContext = { taxRate: 0, taxState: '', travelCost: 0, travelHours: 0, warehouse: '', miles: 0, ok: false, taxSource: 'none' };
+    zipContext = { taxRate: 0, taxState: '', travelCost: 0, travelHours: 0, warehouse: '', miles: 0, ok: false, taxSource: 'none', travelSource: 'none' };
     els.zipStatus.value = 'Enter 5-digit ZIP';
     document.getElementById('lookupDetails').textContent = 'Enter a valid ZIP code to calculate travel and tax.';
     compute();
@@ -512,6 +550,7 @@ async function fetchZipData(zip) {
     const taxLabelMap = {
       combined_city: 'Combined city tax',
       combined_zip_min: 'Combined ZIP tax',
+      built_in_combined_fallback: 'Built-in combined tax fallback',
       state_fallback: 'State tax fallback'
     };
     const taxLabel = taxLabelMap[zipContext.taxSource] || 'Combined tax';
@@ -541,17 +580,28 @@ async function fetchZipData(zip) {
 
     async function routeTo(wh) {
       const url = `https://router.project-osrm.org/route/v1/driving/${wh.lon},${wh.lat};${lon},${lat}?overview=false`;
-      const res = await fetch(url, { cache: 'no-store' });
-      if (!res.ok) throw new Error('Routing failed');
-      const d = await res.json();
-      const route = d.routes?.[0];
-      if (!route) throw new Error('No route');
+      try {
+        const res = await fetch(url, { cache: 'no-store' });
+        if (!res.ok) throw new Error('Routing failed');
+        const d = await res.json();
+        const route = d.routes?.[0];
+        if (!route) throw new Error('No route');
 
-      return {
-        wh: wh.name,
-        miles: route.distance / 1609.344,
-        hours: route.duration / 3600
-      };
+        return {
+          wh: wh.name,
+          miles: route.distance / 1609.344,
+          hours: route.duration / 3600,
+          source: 'live_route'
+        };
+      } catch (err) {
+        const miles = haversineMiles(wh.lat, wh.lon, lat, lon) * 1.18;
+        return {
+          wh: wh.name,
+          miles,
+          hours: estimateDriveHoursFromMiles(miles),
+          source: 'route_fallback'
+        };
+      }
     }
 
     const [taxResult, routes] = await Promise.all([
@@ -563,6 +613,7 @@ async function fetchZipData(zip) {
     const taxLabelMap = {
       combined_city: 'Combined city tax',
       combined_zip_min: 'Combined ZIP tax',
+      built_in_combined_fallback: 'Built-in combined tax fallback',
       state_fallback: 'State tax fallback'
     };
     const taxLabel = taxLabelMap[taxResult.source] || 'Combined tax';
@@ -570,12 +621,7 @@ async function fetchZipData(zip) {
     routes.sort((a, b) => a.hours - b.hours);
     const best = routes[0];
 
-    let travelCost = 2400;
-    if (best.hours <= 2) travelCost = 0;
-    else if (best.hours <= 4) travelCost = 300;
-    else if (best.hours <= 8) travelCost = 975;
-    else if (best.hours <= 12) travelCost = 1350;
-    else if (best.hours <= 16) travelCost = 1750;
+    const travelCost = getTravelCostFromHours(best.hours);
 
     zipContext = {
       taxRate: taxResult.rate,
@@ -585,19 +631,20 @@ async function fetchZipData(zip) {
       warehouse: best.wh,
       miles: best.miles,
       ok: true,
-      taxSource: taxResult.source
+      taxSource: taxResult.source,
+      travelSource: best.source
     };
 
     zipCache.set(zip, { ...zipContext });
 
     els.zipStatus.value = `OK - ${stateAbbr} / ${best.wh}`;
     document.getElementById('lookupDetails').innerHTML =
-      `ZIP resolves to <b>${place['place name']}, ${stateAbbr}</b>. Closest warehouse: <b>${best.wh}</b>. Approx route: <b>${best.miles.toFixed(0)} miles</b> / <b>${best.hours.toFixed(1)} hrs</b>. Tax source: <b>${taxLabel}</b>. Tax rate used: <b>${pct(taxResult.rate)}</b>. Source check: <b>${taxResult.compared || taxLabel}</b>. Travel band: <b>${money(travelCost)}</b>.`;
+      `ZIP resolves to <b>${place['place name']}, ${stateAbbr}</b>. Closest warehouse: <b>${best.wh}</b>. Approx route: <b>${best.miles.toFixed(0)} miles</b> / <b>${best.hours.toFixed(1)} hrs</b> (${best.source === 'route_fallback' ? 'route fallback' : 'live route'}). Tax source: <b>${taxLabel}</b>. Tax rate used: <b>${pct(taxResult.rate)}</b>. Source check: <b>${taxResult.compared || taxLabel}</b>. Travel band: <b>${money(travelCost)}</b>.`;
 
     compute();
   } catch (err) {
     if (requestId !== zipLookupSeq) return;
-    zipContext = { taxRate: 0, taxState: '', travelCost: 0, travelHours: 0, warehouse: '', miles: 0, ok: false, taxSource: 'none' };
+    zipContext = { taxRate: 0, taxState: '', travelCost: 0, travelHours: 0, warehouse: '', miles: 0, ok: false, taxSource: 'none', travelSource: 'none' };
     els.zipStatus.value = 'ZIP lookup failed';
     document.getElementById('lookupDetails').textContent = 'ZIP lookup failed. Check internet connection or ZIP entry.';
     compute();
@@ -656,9 +703,9 @@ function compute() {
   const grandRaw = subtotal + tax + travel;
   const grand = ceilTo(grandRaw, 50);
 
-  const deposit = grand * 0.10;
-  const arrival = grand * 0.38;
-  const finalPay = grand - deposit - arrival;
+  const deposit = round2(grand * 0.10);
+  const arrival = round2(grand * 0.38);
+  const finalPay = round2(grand - deposit - arrival);
   const commission = subtotal * 0.03;
 
   document.getElementById('outMain').textContent = money(adjustedMainPrice);
@@ -696,7 +743,7 @@ els.zip.addEventListener('input', e => {
   clearTimeout(zipLookupTimer);
 
   if (zip.length !== 5) {
-    zipContext = { taxRate: 0, taxState: '', travelCost: 0, travelHours: 0, warehouse: '', miles: 0, ok: false, taxSource: 'none' };
+    zipContext = { taxRate: 0, taxState: '', travelCost: 0, travelHours: 0, warehouse: '', miles: 0, ok: false, taxSource: 'none', travelSource: 'none' };
     els.zipStatus.value = zip.length ? 'Keep typing ZIP...' : 'Waiting for ZIP';
     document.getElementById('lookupDetails').textContent = 'Enter a ZIP code to calculate travel and tax.';
     compute();

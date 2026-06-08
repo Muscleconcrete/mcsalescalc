@@ -4,6 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Muscle Concrete Sales Calculator</title>
+<!-- Travel pricing update v8: calibrated mileage billable hours -->
 <style>
   :root {
     --bg:#f5f5f5;
@@ -322,7 +323,7 @@ const DATA = {
 };
 
 const els = Object.fromEntries([...document.querySelectorAll('input,select,textarea')].map(el => [el.id, el]));
-let zipContext = { taxRate: 0, taxState: '', travelCost: 0, travelHours: 0, warehouse: '', miles: 0, ok: false, taxSource: 'none', travelSource: 'none' };
+let zipContext = { taxRate: 0, taxState: '', travelCost: 0, travelHours: 0, billableTravelHours: 0, warehouse: '', miles: 0, ok: false, taxSource: 'none', travelSource: 'none' };
 const zipCache = new Map();
 let zipLookupTimer = null;
 let zipLookupSeq = 0;
@@ -350,15 +351,27 @@ function haversineMiles(lat1, lon1, lat2, lon2) {
   return 2 * R * Math.asin(Math.sqrt(a));
 }
 function estimateDriveHoursFromMiles(miles) {
-  return miles <= 0 ? 250 : Math.max(miles / 52, miles / 60 + 0.35);
+  // Billable travel should not use the routing service's inflated drive-time estimate.
+  // Use a calibrated mileage estimate instead, so a practical 9-hour route like ZIP 18822
+  // stays in the 8-10 hour / $995 band instead of being pushed to 11-12 hours.
+  const m = Number(miles) || 0;
+  return m <= 0 ? 250 : m / 62;
 }
 function getTravelCostFromHours(hours) {
-  if (hours <= 2) return 0;
-  if (hours <= 4) return 300;
-  if (hours <= 8) return 975;
-  if (hours <= 12) return 1350;
-  if (hours <= 16) return 1750;
-  return 2400;
+  // Band by actual route minutes. The $1,300 tier starts at 11:00,
+  // so any route from 8:00 through 10:59 stays in the $995 band.
+  const minutes = Math.floor((Number(hours) || 0) * 60 + 1e-6);
+
+  if (minutes <= 120) return 175;   // 0-2 hrs
+  if (minutes <= 240) return 375;   // >2-4 hrs
+  if (minutes <= 300) return 500;   // >4-5 hrs
+  if (minutes <= 360) return 675;   // >5-6 hrs
+  if (minutes <= 480) return 800;   // >6-8 hrs
+  if (minutes < 660) return 995;    // >8-10 hrs, up to 10h59m
+  if (minutes <= 720) return 1300;  // 11-12 hrs
+  if (minutes <= 900) return 1675;  // >12-15 hrs
+  if (minutes <= 1020) return 2000; // >15-17 hrs
+  return 2700;                      // 17+ hrs
 }
 function getBuiltInCombinedFallbackRate(stateAbbr) {
   return BUILT_IN_COMBINED_TAX_FALLBACK[String(stateAbbr || '').toUpperCase()] ?? DATA.stateTax[String(stateAbbr || '').toUpperCase()] ?? 0;
@@ -585,7 +598,7 @@ async function fetchZipData(zip) {
   const requestId = ++zipLookupSeq;
 
   if (!/^\d{5}$/.test(zip)) {
-    zipContext = { taxRate: 0, taxState: '', travelCost: 0, travelHours: 0, warehouse: '', miles: 0, ok: false, taxSource: 'none', travelSource: 'none' };
+    zipContext = { taxRate: 0, taxState: '', travelCost: 0, travelHours: 0, billableTravelHours: 0, warehouse: '', miles: 0, ok: false, taxSource: 'none', travelSource: 'none' };
     els.zipStatus.value = 'Enter 5-digit ZIP';
     document.getElementById('lookupDetails').textContent = 'Enter a valid ZIP code to calculate travel and tax.';
     compute();
@@ -603,7 +616,7 @@ async function fetchZipData(zip) {
     const taxLabel = taxLabelMap[zipContext.taxSource] || 'Combined tax';
     els.zipStatus.value = `OK - ${zipContext.taxState} / ${zipContext.warehouse || 'Travel pending'}`;
     document.getElementById('lookupDetails').innerHTML =
-      `Cached ZIP result. Tax source: <b>${taxLabel}</b>. Tax rate used: <b>${pct(zipContext.taxRate || 0)}</b>. Travel band: <b>${money(zipContext.travelCost || 0)}</b>.`;
+      `Cached ZIP result. Tax source: <b>${taxLabel}</b>. Tax rate used: <b>${pct(zipContext.taxRate || 0)}</b>. Billable travel time: <b>${(zipContext.billableTravelHours || zipContext.travelHours || 0).toFixed(1)} hrs</b>. Travel band: <b>${money(zipContext.travelCost || 0)}</b>.`;
     compute();
     return;
   }
@@ -668,13 +681,18 @@ async function fetchZipData(zip) {
     routes.sort((a, b) => a.hours - b.hours);
     const best = routes[0];
 
-    const travelCost = getTravelCostFromHours(best.hours);
+    // Use the live route for warehouse selection, but price travel from the lower
+    // of the live-route duration and the calibrated mileage estimate. The mileage
+    // estimate prevents routes like ZIP 18822 from being inflated into the 11-12 hr band.
+    const billableHours = Math.min(best.hours, estimateDriveHoursFromMiles(best.miles));
+    const travelCost = getTravelCostFromHours(billableHours);
 
     zipContext = {
       taxRate: taxResult.rate,
       taxState: stateAbbr,
       travelCost,
       travelHours: best.hours,
+      billableTravelHours: billableHours,
       warehouse: best.wh,
       miles: best.miles,
       ok: true,
@@ -686,12 +704,12 @@ async function fetchZipData(zip) {
 
     els.zipStatus.value = `OK - ${stateAbbr} / ${best.wh}`;
     document.getElementById('lookupDetails').innerHTML =
-      `ZIP resolves to <b>${place['place name']}, ${stateAbbr}</b>. Closest warehouse: <b>${best.wh}</b>. Approx route: <b>${best.miles.toFixed(0)} miles</b> / <b>${best.hours.toFixed(1)} hrs</b> (${best.source === 'route_fallback' ? 'route fallback' : 'live route'}). Tax source: <b>${taxLabel}</b>. Tax rate used: <b>${pct(taxResult.rate)}</b>. Source check: <b>${taxResult.compared || taxLabel}</b>. Travel band: <b>${money(travelCost)}</b>.`;
+      `ZIP resolves to <b>${place['place name']}, ${stateAbbr}</b>. Closest warehouse: <b>${best.wh}</b>. Approx route: <b>${best.miles.toFixed(0)} miles</b> / <b>${best.hours.toFixed(1)} hrs</b> (${best.source === 'route_fallback' ? 'route fallback' : 'live route'}). Billable travel time: <b>${billableHours.toFixed(1)} hrs</b>. Tax source: <b>${taxLabel}</b>. Tax rate used: <b>${pct(taxResult.rate)}</b>. Source check: <b>${taxResult.compared || taxLabel}</b>. Travel band: <b>${money(travelCost)}</b>.`;
 
     compute();
   } catch (err) {
     if (requestId !== zipLookupSeq) return;
-    zipContext = { taxRate: 0, taxState: '', travelCost: 0, travelHours: 0, warehouse: '', miles: 0, ok: false, taxSource: 'none', travelSource: 'none' };
+    zipContext = { taxRate: 0, taxState: '', travelCost: 0, travelHours: 0, billableTravelHours: 0, warehouse: '', miles: 0, ok: false, taxSource: 'none', travelSource: 'none' };
     els.zipStatus.value = 'ZIP lookup failed';
     document.getElementById('lookupDetails').textContent = 'ZIP lookup failed. Check internet connection or ZIP entry.';
     compute();
@@ -711,7 +729,10 @@ function compute() {
   };
 
   const mainFooterUpchargeRate = getFooterDepth(mainFooter) > 24 ? 0.06 : 0;
-  const adjustedMainPrice = ceilTo((main.price + 250) * (1 + mainFooterUpchargeRate), 50);
+  // Main Building only: reduce base size pricing by $375 when the top width/length selection is over 1,000 sq ft.
+  // Lean-to pricing stays unchanged.
+  const mainBuildingOnlyBaseSizeReduction = (mainWidth * mainLength) > 1000 ? 375 : 0;
+  const adjustedMainPrice = Math.max(0, ceilTo((main.price + 250) * (1 + mainFooterUpchargeRate), 50) - mainBuildingOnlyBaseSizeReduction);
 
   const add6Base = els.add6.value === 'yes' ? lookupPrice(DATA.add6, mainWidth, mainLength).price : 0;
   const add6 = add6Base > 0 ? add6Base + 100 : 0;
@@ -812,7 +833,7 @@ els.zip.addEventListener('input', e => {
   clearTimeout(zipLookupTimer);
 
   if (zip.length !== 5) {
-    zipContext = { taxRate: 0, taxState: '', travelCost: 0, travelHours: 0, warehouse: '', miles: 0, ok: false, taxSource: 'none', travelSource: 'none' };
+    zipContext = { taxRate: 0, taxState: '', travelCost: 0, travelHours: 0, billableTravelHours: 0, warehouse: '', miles: 0, ok: false, taxSource: 'none', travelSource: 'none' };
     els.zipStatus.value = zip.length ? 'Keep typing ZIP...' : 'Waiting for ZIP';
     document.getElementById('lookupDetails').textContent = 'Enter a ZIP code to calculate travel and tax.';
     compute();
